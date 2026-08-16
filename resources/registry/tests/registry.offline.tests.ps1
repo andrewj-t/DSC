@@ -4,6 +4,33 @@
 Describe 'Registry offline hive tests' -Skip:(!$IsWindows) {
     BeforeAll {
         $testHivesSource = Join-Path $PSScriptRoot 'test_hives'
+
+        # Applies a deterministic, machine-independent descriptor to a file:
+        # inheritance blocked, exactly one explicit ACE for BUILTIN\Administrators.
+        # Deliberately not the current user - CI agents differ.
+        function Set-MarkerAcl {
+            param([string]$Path)
+            $admins = [System.Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+            $acl = Get-Acl -LiteralPath $Path
+            $acl.SetAccessRuleProtection($true, $false)   # protect, drop inherited
+            $acl.AddAccessRule(
+                [System.Security.AccessControl.FileSystemAccessRule]::new(
+                    $admins, 'FullControl', 'Allow'))
+            Set-Acl -LiteralPath $Path -AclObject $acl
+        }
+
+        function Get-AclSummary {
+            param([string]$Path)
+            $acl = Get-Acl -LiteralPath $Path
+            [pscustomobject]@{
+                Protected = $acl.AreAccessRulesProtected
+                AceCount  = @($acl.Access).Count
+                Sids      = @($acl.Access | ForEach-Object {
+                                $_.IdentityReference.Translate(
+                                    [System.Security.Principal.SecurityIdentifier]).Value } | Sort-Object)
+                Owner     = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            }
+        }
     }
 
     Context 'Get from offline HKLM hive' {
@@ -356,6 +383,350 @@ resources:
             $getResult = registry config get --input $getJson 2>$null | ConvertFrom-Json
             $getResult._exist | Should -Not -Be $false
             $getResult.valueData.String | Should -Be 'TestValue'
+        }
+    }
+
+    <#
+        Regression tests for two offline-registry defects:
+
+          Issue 1 - `get` does not return `registryFilePath`, so the synthetic test never
+                    converges and offline operations are never idempotent.
+          Issue 2 - `OfflineHive::save` deletes the target file before calling ORSaveHive,
+                    discarding the file's DACL, inheritance-protection flag and owner.
+
+        None of these require elevation, except where noted.
+
+        Each test is tagged in a comment as:
+          [FAILS TODAY]  - currently red; turns green when the defect is fixed.
+          [GUARD]        - currently green; present to stop a fix or future change
+                           regressing behaviour that works now.
+
+        Deliberately not asserted:
+
+          * Creation time. ReplaceFile preserves it, but so does NTFS file-system
+            tunnelling, which restores the creation time of a file deleted and recreated
+            under the same name within roughly 15 seconds. The current delete-and-rewrite
+            implementation would therefore pass a creation-time assertion for the wrong
+            reason, making it useless as a regression test.
+          * File ID / index number. ReplaceFile documents that the resulting file takes the
+            file ID of the *replacement*, so this legitimately changes under the suggested
+            fix and must not be asserted as stable.
+    #>
+
+    # ---------------------------------------------------------------------------
+    # Issue 1 - registryFilePath must round-trip so the synthetic test can converge
+    # ---------------------------------------------------------------------------
+
+    Context 'Issue 1 - registryFilePath round-trips through get' {
+
+        BeforeEach {
+            $script:hive = Join-Path $TestDrive 'HKLM_roundtrip.hiv'
+            Copy-Item (Join-Path $testHivesSource 'HKLM.hiv') -Destination $script:hive -Force
+        }
+
+        # [FAILS TODAY] The core assertion. Everything else in Issue 1 follows from this.
+        It 'Returns registryFilePath for an existing value' {
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'TestString'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            $result = registry config get --input $json 2>$null | ConvertFrom-Json
+            $LASTEXITCODE | Should -Be 0
+            $result.registryFilePath | Should -Be $script:hive
+        }
+
+        # [FAILS TODAY] get_offline has four return sites. The two "not found" paths are
+        # the easy ones to miss when applying the fix, so cover them explicitly.
+        It 'Returns registryFilePath when the key does not exist' {
+            $json = @{
+                keyPath          = 'HKLM\Software\NoSuchKey'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            $result = registry config get --input $json 2>$null | ConvertFrom-Json
+            $result._exist          | Should -BeFalse
+            $result.registryFilePath | Should -Be $script:hive
+        }
+
+        # [FAILS TODAY]
+        It 'Returns registryFilePath when the value does not exist' {
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'NoSuchValue'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            $result = registry config get --input $json 2>$null | ConvertFrom-Json
+            $result._exist          | Should -BeFalse
+            $result.registryFilePath | Should -Be $script:hive
+        }
+
+        # [FAILS TODAY]
+        It 'Returns registryFilePath for a key-only get' {
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            $result = registry config get --input $json 2>$null | ConvertFrom-Json
+            $result.registryFilePath | Should -Be $script:hive
+        }
+
+        # [GUARD] The fix must not start emitting the property on the live path - that
+        # would break idempotency for every existing live-registry instance.
+        It 'Omits registryFilePath when operating on the live registry' {
+            $json = @{ keyPath = 'HKCU\Software' } | ConvertTo-Json -Compress
+
+            $result = registry config get --input $json 2>$null | ConvertFrom-Json
+            $LASTEXITCODE | Should -Be 0
+            $result.PSObject.Properties.Name | Should -Not -Contain 'registryFilePath'
+        }
+    }
+
+    Context 'Issue 1 - offline instances converge' {
+
+        BeforeEach {
+            $script:hive = Join-Path $TestDrive 'HKLM_converge.hiv'
+            Copy-Item (Join-Path $testHivesSource 'HKLM.hiv') -Destination $script:hive -Force
+            $script:instance = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'ConvergeMe'
+                valueData        = @{ DWord = 7 }
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress -Depth 3
+        }
+
+        # [FAILS TODAY] The user-visible symptom. Kept separate from the get test above:
+        # a fix that satisfies one without the other (for example by suppressing the
+        # property from comparison rather than returning it) should still be caught.
+        It 'Reports inDesiredState after a successful set' {
+            dsc resource set -r Microsoft.Windows/Registry --input $script:instance 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            $test = dsc resource test -r Microsoft.Windows/Registry --input $script:instance 2>$null |
+                ConvertFrom-Json
+            $test.inDesiredState      | Should -BeTrue
+            $test.differingProperties | Should -BeNullOrEmpty
+        }
+
+        # [FAILS TODAY] The concrete harm. Microsoft.Windows/Registry does not declare
+        # set.implementsPretest, so DSC tests first and skips set entirely when the
+        # instance is already in the desired state. A converged instance must therefore
+        # leave the hive file completely untouched on a second run.
+        It 'Does not rewrite the hive file on a redundant set' {
+            dsc resource set -r Microsoft.Windows/Registry --input $script:instance 2>$null | Out-Null
+            $stamp = (Get-Item -LiteralPath $script:hive).LastWriteTimeUtc
+            $bytes = (Get-Item -LiteralPath $script:hive).Length
+
+            Start-Sleep -Milliseconds 1100   # ensure a rewrite would be observable
+
+            dsc resource set -r Microsoft.Windows/Registry --input $script:instance 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            (Get-Item -LiteralPath $script:hive).LastWriteTimeUtc | Should -Be $stamp
+            (Get-Item -LiteralPath $script:hive).Length           | Should -Be $bytes
+        }
+
+        # [FAILS TODAY] what-if on an already-converged instance should report nothing to do.
+        It 'Reports no changes for what-if on a converged instance' {
+            dsc resource set -r Microsoft.Windows/Registry --input $script:instance 2>$null | Out-Null
+
+            $whatIf = dsc resource set -w -r Microsoft.Windows/Registry --input $script:instance 2>$null |
+                ConvertFrom-Json
+            $whatIf.changedProperties | Should -BeNullOrEmpty
+        }
+    }
+
+    Context 'Issue 1 - RegistryList' {
+
+        BeforeEach {
+            $script:hive = Join-Path $TestDrive 'HKLM_listconverge.hiv'
+            Copy-Item (Join-Path $testHivesSource 'HKLM.hiv') -Destination $script:hive -Force
+            $script:list = @{
+                registryFilePath = $script:hive
+                registryEntries  = @(
+                    @{ keyPath = 'HKLM\Software\DSCTest'; valueName = 'L1'; valueData = @{ DWord = 1 } }
+                    @{ keyPath = 'HKLM\Software\DSCTest'; valueName = 'L2'; valueData = @{ String = 'two' } }
+                )
+            } | ConvertTo-Json -Compress -Depth 5
+        }
+
+        # [FAILS TODAY] The list-level property is propagated to each entry, so it has to
+        # round-trip at the list level too.
+        It 'Returns the list-level registryFilePath from get' {
+            $result = registry config get --list --input $script:list 2>$null | ConvertFrom-Json
+            $LASTEXITCODE | Should -Be 0
+            $result.registryFilePath | Should -Be $script:hive
+        }
+
+        # [FAILS TODAY]
+        It 'Reports inDesiredState after a successful list set' {
+            dsc resource set -r Microsoft.Windows/RegistryList --input $script:list 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            $test = dsc resource test -r Microsoft.Windows/RegistryList --input $script:list 2>$null |
+                ConvertFrom-Json
+            $test.inDesiredState      | Should -BeTrue
+            $test.differingProperties | Should -BeNullOrEmpty
+        }
+    }
+
+    # ---------------------------------------------------------------------------
+    # Issue 2 - saving must not disturb the hive file's security descriptor
+    # ---------------------------------------------------------------------------
+
+    Context 'Issue 2 - security descriptor is preserved across save' {
+
+        BeforeEach {
+            $script:hive = Join-Path $TestDrive 'HKLM_acl.hiv'
+            Copy-Item (Join-Path $testHivesSource 'HKLM.hiv') -Destination $script:hive -Force
+            Set-MarkerAcl -Path $script:hive
+            $script:before = Get-AclSummary -Path $script:hive
+        }
+
+        # [FAILS TODAY] Today: Protected goes True -> False and the explicit ACE is
+        # replaced by whatever the containing directory hands down.
+        It 'Preserves the DACL and inheritance-protection flag across set' {
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'AclProbe'
+                valueData        = @{ DWord = 1 }
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress -Depth 3
+
+            registry config set --input $json 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            $after = Get-AclSummary -Path $script:hive
+            $after.Protected | Should -BeTrue
+            $after.AceCount  | Should -Be $script:before.AceCount
+            $after.Sids      | Should -Be $script:before.Sids
+        }
+
+        # [FAILS TODAY] remove_offline has two separate save call sites (value delete and
+        # key delete). Cover both so a fix applied to only one is caught.
+        It 'Preserves the DACL across value delete' {
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'TestString'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            registry config delete --input $json 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            $after = Get-AclSummary -Path $script:hive
+            $after.Protected | Should -BeTrue
+            $after.Sids      | Should -Be $script:before.Sids
+        }
+
+        # [FAILS TODAY]
+        It 'Preserves the DACL across key delete' {
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            registry config delete --input $json 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            $after = Get-AclSummary -Path $script:hive
+            $after.Protected | Should -BeTrue
+            $after.Sids      | Should -Be $script:before.Sids
+        }
+
+        # [INCONCLUSIVE WITHOUT SETUP] ReplaceFile does not preserve the owner, so a fix
+        # based on it needs to restore the owner explicitly. This only exercises the defect
+        # when the hive's owner differs from the identity running the test - otherwise a
+        # recreated file gets the same owner and the assertion passes for the wrong reason.
+        # Setting a foreign owner needs SeRestorePrivilege, hence the elevation gate.
+        It 'Preserves the file owner across set' -Skip:(-not ([System.Security.Principal.WindowsPrincipal]::new(
+                [System.Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole(
+                [System.Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            # Give the file an owner that is not the writing process.
+            $acl = Get-Acl -LiteralPath $script:hive
+            $acl.SetOwner([System.Security.Principal.SecurityIdentifier]::new('S-1-5-18'))  # SYSTEM
+            Set-Acl -LiteralPath $script:hive -AclObject $acl
+            $script:before = Get-AclSummary -Path $script:hive
+            $script:before.Owner | Should -Be 'S-1-5-18'
+
+            $json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'OwnerProbe'
+                valueData        = @{ DWord = 1 }
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress -Depth 3
+
+            registry config set --input $json 2>$null | Out-Null
+            (Get-AclSummary -Path $script:hive).Owner | Should -Be $script:before.Owner
+        }
+    }
+
+    Context 'Issue 2 - save is safe and leaves no debris' {
+
+        BeforeEach {
+            $script:dir  = Join-Path $TestDrive ([guid]::NewGuid().ToString('N'))
+            New-Item -ItemType Directory -Path $script:dir | Out-Null
+            $script:hive = Join-Path $script:dir 'HKLM_safe.hiv'
+            Copy-Item (Join-Path $testHivesSource 'HKLM.hiv') -Destination $script:hive -Force
+            $script:json = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'SafeProbe'
+                valueData        = @{ DWord = 1 }
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress -Depth 3
+        }
+
+        # [GUARD] A ReplaceFile-based fix writes a temporary file and optionally a backup.
+        # Neither may survive a successful save.
+        It 'Leaves no temporary or backup files after a successful set' {
+            registry config set --input $script:json 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            @(Get-ChildItem -LiteralPath $script:dir -Force).Name | Should -Be @('HKLM_safe.hiv')
+        }
+
+        # [GUARD] Currently passes because remove_file fails before anything is destroyed.
+        # The point is to keep it passing: a ReplaceFile-based fix must pass a backup file
+        # name, otherwise the documented ERROR_UNABLE_TO_MOVE_REPLACEMENT path leaves the
+        # target deleted - the same exposure this issue is about.
+        It 'Leaves the hive intact when the save cannot complete' {
+            $original = (Get-FileHash -LiteralPath $script:hive -Algorithm SHA256).Hash
+
+            # Deny delete and write to other processes while permitting the read that
+            # OROpenHive needs.
+            $lock = [System.IO.File]::Open(
+                $script:hive,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::Read)
+            try {
+                registry config set --input $script:json 2>$null | Out-Null
+                $LASTEXITCODE | Should -Not -Be 0
+            }
+            finally {
+                $lock.Dispose()
+            }
+
+            Test-Path -LiteralPath $script:hive | Should -BeTrue
+            (Get-FileHash -LiteralPath $script:hive -Algorithm SHA256).Hash | Should -Be $original
+        }
+
+        # [GUARD] Any change to how the hive is written must keep unrelated content intact.
+        It 'Preserves unrelated existing values across a save' {
+            registry config set --input $script:json 2>$null | Out-Null
+            $LASTEXITCODE | Should -Be 0
+
+            $check = @{
+                keyPath          = 'HKLM\Software\DSCTest'
+                valueName        = 'TestString'
+                registryFilePath = $script:hive
+            } | ConvertTo-Json -Compress
+
+            $result = registry config get --input $check 2>$null | ConvertFrom-Json
+            $result.valueData.String | Should -Be 'TestValue'
         }
     }
 }
